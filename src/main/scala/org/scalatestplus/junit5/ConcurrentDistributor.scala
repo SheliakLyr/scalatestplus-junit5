@@ -18,40 +18,45 @@ package org.scalatestplus.junit5
 import org.scalatest._
 import org.scalactic.Requirements._
 import java.util.concurrent.ExecutorService
-import java.util.concurrent.Future
-import java.util.concurrent.LinkedBlockingQueue
+import scala.util.{Failure, Success}
 
 /**
  * This Distributor can be used by multiple threads.
  *
  * @author Bill Venners
  */
-private[junit5] class ConcurrentDistributor(args: Args, execSvc: ExecutorService) extends Distributor {
-
-  private val futureQueue = new LinkedBlockingQueue[Future[_]]
-
-  def apply(suite: Suite, tracker: Tracker): Unit = {
-    apply(suite, args.copy(tracker = tracker))
-  }
+private[junit5] class ConcurrentDistributor(execSvc: ExecutorService) extends Distributor {
  
   def apply(suite: Suite, args: Args): Status = {
     requireNonNull(suite, args)
     val status = new StatefulStatus
     val suiteRunner = new Runnable {
       override def run(): Unit = {
-        suite.run(None, args)
-        status.setCompleted()
+        try {
+          // Do not mark the distributed status complete until the Status returned
+          // by the suite has completed. This is important for ParallelTestExecution:
+          // suite.run returns before its distributed tests finish.
+          val runStatus = suite.run(None, args)
+          runStatus.whenCompleted {
+            case Success(succeeded) =>
+              if (!succeeded)
+                status.setFailed()
+              status.setCompleted()
+            case Failure(t) =>
+              status.setFailedWith(t)
+              status.setCompleted()
+          }
+        }
+        catch {
+          case t: Throwable =>
+            status.setFailedWith(t)
+            status.setCompleted()
+        }
       }
     }
-    val future: Future[_] = execSvc.submit(suiteRunner)
-    futureQueue.put(future)
+    execSvc.submit(suiteRunner)
     status
   }
 
   def poll() = None
-
-  def waitUntilDone(): Unit = {
-    while (futureQueue.peek != null)
-      futureQueue.poll().get()
-  }
 }

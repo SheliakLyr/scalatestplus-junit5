@@ -19,7 +19,31 @@ import org.junit.platform.engine.{EngineExecutionListener, TestDescriptor, TestE
 import org.scalatest.{Resources => _, _}
 import org.scalatest.events._
 
+import java.util.concurrent.atomic.AtomicReference
+
 private[junit5] class EngineExecutionListenerReporter(listener: EngineExecutionListener, clzDesc: ScalaTestClassDescriptor, engineDesc: TestDescriptor) extends Reporter {
+
+  // SuiteAborted may arrive on a ParallelTestExecution worker thread while the
+  // suite completion callback is running elsewhere. Store the result atomically
+  // so exactly one path delivers executionFinished(clzDesc, ...).
+  private val _suiteResult = new AtomicReference[Option[TestExecutionResult]](None)
+  private val suiteFinishLock = new AnyRef
+  private[junit5] def suiteResult: Option[TestExecutionResult] = _suiteResult.get()
+
+  // RunAborted is a run-level event, not a result for this class descriptor.
+  // execute()'s finally block is solely responsible for engineDesc.
+  @volatile private[junit5] var runAborted: Option[Throwable] = None
+
+  private[junit5] def finishSuite(result: TestExecutionResult): Boolean = {
+    suiteFinishLock.synchronized {
+      if (_suiteResult.compareAndSet(None, Some(result))) {
+        listener.executionFinished(clzDesc, result)
+        true
+      }
+      else
+        false
+    }
+  }
 
   // This form isn't clearly specified in JUnit docs, but some tools may assume it, so why rock the boat.
   // Here's what JUnit code does:
@@ -80,12 +104,12 @@ private[junit5] class EngineExecutionListenerReporter(listener: EngineExecutionL
         listener.executionSkipped(testDesc, "Test pending.")
 
       case SuiteAborted(ordinal, message, suiteName, suiteId, suiteClassName, throwable, duration, formatter, location, rerunnable, payload, threadName, timeStamp) =>
-        val throwableOrNull = throwable.orNull
-        listener.executionFinished(clzDesc, TestExecutionResult.aborted(throwableOrNull))
+        finishSuite(TestExecutionResult.aborted(throwable.orNull))
 
       case RunAborted(ordinal, message, throwable, duration, summary, formatter, location, payload, threadName, timeStamp) =>
-        val throwableOrNull = throwable.orNull
-        listener.executionFinished(engineDesc, TestExecutionResult.aborted(throwableOrNull))
+        // Do not finish engineDesc here. execute()'s finally block is solely
+        // responsible for that lifecycle; finishing it here would double-deliver.
+        runAborted = Some(throwable.getOrElse(new RuntimeException(message)))
 
       case _ =>
     }
