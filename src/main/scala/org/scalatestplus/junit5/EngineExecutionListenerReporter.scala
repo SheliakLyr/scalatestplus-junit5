@@ -19,7 +19,28 @@ import org.junit.platform.engine.{EngineExecutionListener, TestDescriptor, TestE
 import org.scalatest.{Resources => _, _}
 import org.scalatest.events._
 
+import java.util.concurrent.atomic.AtomicReference
+
 private[junit5] class EngineExecutionListenerReporter(listener: EngineExecutionListener, clzDesc: ScalaTestClassDescriptor, engineDesc: TestDescriptor) extends Reporter {
+
+  // SuiteAborted and the suite completion callback may race to finish clzDesc.
+  private val _suiteResult = new AtomicReference[Option[TestExecutionResult]](None)
+  private val suiteFinishLock = new AnyRef
+  private[junit5] def suiteResult: Option[TestExecutionResult] = _suiteResult.get()
+
+  // RunAborted belongs to the engine descriptor, which execute() finishes.
+  @volatile private[junit5] var runAborted: Option[Throwable] = None
+
+  private[junit5] def finishSuite(result: TestExecutionResult): Boolean = {
+    suiteFinishLock.synchronized {
+      if (_suiteResult.compareAndSet(None, Some(result))) {
+        listener.executionFinished(clzDesc, result)
+        true
+      }
+      else
+        false
+    }
+  }
 
   // This form isn't clearly specified in JUnit docs, but some tools may assume it, so why rock the boat.
   // Here's what JUnit code does:
@@ -80,12 +101,10 @@ private[junit5] class EngineExecutionListenerReporter(listener: EngineExecutionL
         listener.executionSkipped(testDesc, "Test pending.")
 
       case SuiteAborted(ordinal, message, suiteName, suiteId, suiteClassName, throwable, duration, formatter, location, rerunnable, payload, threadName, timeStamp) =>
-        val throwableOrNull = throwable.orNull
-        listener.executionFinished(clzDesc, TestExecutionResult.aborted(throwableOrNull))
+        finishSuite(TestExecutionResult.aborted(throwable.orNull))
 
       case RunAborted(ordinal, message, throwable, duration, summary, formatter, location, payload, threadName, timeStamp) =>
-        val throwableOrNull = throwable.orNull
-        listener.executionFinished(engineDesc, TestExecutionResult.aborted(throwableOrNull))
+        runAborted = Some(throwable.getOrElse(new RuntimeException(message)))
 
       case _ =>
     }

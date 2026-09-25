@@ -29,7 +29,7 @@ import java.util.Optional
  * @param theUniqueId The unique ID.
  * @param suiteClass The class of the ScalaTest suite.
  */
-class ScalaTestClassDescriptor(parent: TestDescriptor, val theUniqueId: UniqueId, val suiteClass: Class[_], autoAddTestChildren: Boolean) extends AbstractTestDescriptor(theUniqueId, suiteClass.getName, ClassSource.from(suiteClass)) {
+class ScalaTestClassDescriptor(parent: TestDescriptor, val theUniqueId: UniqueId, val suiteClass: Class[_], val autoAddTestChildren: Boolean) extends AbstractTestDescriptor(theUniqueId, suiteClass.getName, ClassSource.from(suiteClass)) {
 
   /**
    * Suite instance that will be executed if this class descriptor is selected.

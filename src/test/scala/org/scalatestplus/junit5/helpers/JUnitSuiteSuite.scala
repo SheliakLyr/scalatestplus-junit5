@@ -52,6 +52,112 @@ package org.scalatestplus.junit5 {
       @Test def verifySomething(): Unit = ()
       @Test def verifySomethingElse(): Unit = ()
     }
+
+    class SimpleScalaTestSuite extends org.scalatest.funspec.AnyFunSpec {
+      it("a simple passing test") { () }
+    }
+
+    class FailingScalaTestSuite extends org.scalatest.funspec.AnyFunSpec {
+      it("a test that always fails") {
+        fail("intentional failure")
+      }
+    }
+
+    object AnyFunSuiteTestTag extends org.scalatest.Tag("com.example.AnyFunSuiteTestTag")
+    object TaggedAnyFunSuiteState {
+      @volatile var testRan: Boolean = false
+    }
+
+    class TaggedAnyFunSuite extends org.scalatest.funsuite.AnyFunSuite {
+      test("a test with a ScalaTest tag", AnyFunSuiteTestTag) {
+        TaggedAnyFunSuiteState.testRan = true
+      }
+    }
+
+    import java.util.concurrent.{CyclicBarrier, TimeUnit}
+
+    object ParallelSuiteHelper {
+      @volatile var thread1Name: String = null
+      @volatile var thread2Name: String = null
+      @volatile var testThread1Name: String = null
+      @volatile var testThread2Name: String = null
+      @volatile var testThread1: Thread = null
+      @volatile var testThread2: Thread = null
+      @volatile var barrier: CyclicBarrier = new CyclicBarrier(2)
+
+      def reset(): Unit = {
+        thread1Name = null
+        thread2Name = null
+        testThread1Name = null
+        testThread2Name = null
+        testThread1 = null
+        testThread2 = null
+        barrier = new CyclicBarrier(2)
+      }
+    }
+
+    class ParallelHelperSuite1 extends org.scalatest.funspec.AnyFunSpec {
+      it("a test in parallel suite 1") {
+        ParallelSuiteHelper.thread1Name = Thread.currentThread().getName
+        ParallelSuiteHelper.barrier.await(5, TimeUnit.SECONDS)
+      }
+    }
+
+    class ParallelHelperSuite2 extends org.scalatest.funspec.AnyFunSpec {
+      it("a test in parallel suite 2") {
+        ParallelSuiteHelper.thread2Name = Thread.currentThread().getName
+        ParallelSuiteHelper.barrier.await(5, TimeUnit.SECONDS)
+      }
+    }
+
+    class ParallelTestExecutionSuite1 extends org.scalatest.funspec.AnyFunSpec with ParallelTestExecution {
+      it("a distributed test in suite 1") {
+        ParallelSuiteHelper.testThread1Name = Thread.currentThread().getName
+        ParallelSuiteHelper.barrier.await(5, TimeUnit.SECONDS)
+      }
+    }
+
+    class ParallelTestExecutionSuite2 extends org.scalatest.funspec.AnyFunSpec with ParallelTestExecution {
+      it("a distributed test in suite 2") {
+        ParallelSuiteHelper.testThread2Name = Thread.currentThread().getName
+        ParallelSuiteHelper.barrier.await(5, TimeUnit.SECONDS)
+      }
+    }
+
+    class ParallelTestExecutionThreadCaptureSuite extends org.scalatest.funspec.AnyFunSpec with ParallelTestExecution {
+      it("thread capture test 1") {
+        ParallelSuiteHelper.testThread1Name = Thread.currentThread().getName
+        ParallelSuiteHelper.testThread1 = Thread.currentThread()
+      }
+      it("thread capture test 2") {
+        ParallelSuiteHelper.testThread2Name = Thread.currentThread().getName
+        ParallelSuiteHelper.testThread2 = Thread.currentThread()
+      }
+    }
+
+    class SuiteAbortingSuite extends org.scalatest.funspec.AnyFunSpec {
+      override def run(testName: Option[String], args: org.scalatest.Args): org.scalatest.Status = {
+        args.reporter(org.scalatest.events.SuiteAborted(
+          args.tracker.nextOrdinal(),
+          "suite aborted without a throwable",
+          suiteName,
+          suiteId,
+          Some(getClass.getName)
+        ))
+        org.scalatest.FailedStatus
+      }
+    }
+
+    class RunAbortingSuite extends org.scalatest.funspec.AnyFunSpec {
+      override def run(testName: Option[String], args: org.scalatest.Args): org.scalatest.Status = {
+        args.reporter(org.scalatest.events.RunAborted(
+          args.tracker.nextOrdinal(),
+          "run aborted",
+          Some(new RuntimeException("run aborted"))
+        ))
+        org.scalatest.SucceededStatus
+      }
+    }
   }
 
   import helpers._

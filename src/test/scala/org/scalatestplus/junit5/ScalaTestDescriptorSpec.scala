@@ -18,9 +18,11 @@ package org.scalatestplus.junit5
 import org.scalatest._
 import org.scalatest.events._
 import org.junit.platform.engine.UniqueId
-import org.junit.platform.engine.support.descriptor.{ClassSource, FilePosition, FileSource, MethodSource}
+import org.junit.platform.engine.support.descriptor.{ClassSource, EngineDescriptor, FilePosition, FileSource, MethodSource}
+import org.scalatestplus.junit5.helpers.{AnyFunSuiteTestTag, TaggedAnyFunSuite}
 
 import java.io.File
+import scala.collection.JavaConverters._
 
 class ScalaTestDescriptorSpec extends funspec.AnyFunSpec {
 
@@ -81,6 +83,21 @@ class ScalaTestDescriptorSpec extends funspec.AnyFunSpec {
         assert(!descriptor1.getSource.isPresent)
       }
 
+    }
+
+    describe("getTags method") {
+      it("should expose tags declared on an individual AnyFunSuite test") {
+        val engineDescriptor = new EngineDescriptor(uniqueId, "ScalaTest EngineDescriptor")
+        val classDescriptor = new ScalaTestClassDescriptor(
+          engineDescriptor,
+          uniqueId.append(ScalaTestClassDescriptor.segmentType, classOf[TaggedAnyFunSuite].getName),
+          classOf[TaggedAnyFunSuite],
+          autoAddTestChildren = true
+        )
+
+        val testDescriptor = classDescriptor.getChildren.asScala.find(_.getDisplayName == "a test with a ScalaTest tag").get
+        assert(testDescriptor.getTags.contains(org.junit.platform.engine.TestTag.create("com.example.AnyFunSuiteTestTag")))
+      }
     }
 
   }

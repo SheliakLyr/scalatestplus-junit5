@@ -21,17 +21,18 @@ import org.junit.platform.engine.support.descriptor.EngineDescriptor
 import org.junit.platform.engine.support.discovery.SelectorResolver.{Match, Resolution}
 import org.junit.platform.engine.support.discovery.{EngineDiscoveryRequestResolver, SelectorResolver}
 import org.junit.platform.engine.{EngineDiscoveryRequest, ExecutionRequest, TestDescriptor, TestExecutionResult, UniqueId}
-import org.scalatest.{Args, ConfigMap, DynaTags, Filter, ParallelTestExecution, Stopper, Tracker}
+import org.scalatest.{Args, ConfigMap, DynaTags, Filter, Stopper, Tracker}
 
 import java.lang.reflect.Modifier
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.Optional
-import java.util.concurrent.{ExecutorService, Executors, ThreadFactory}
+import java.util.concurrent.{CompletableFuture, ExecutorService, Executors, ThreadFactory, TimeUnit}
 import java.util.logging.Logger
 import java.util.stream.Collectors
 import scala.collection.JavaConverters._
+import scala.collection.mutable.ListBuffer
 import scala.reflect.NameTransformer
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 /**
  * ScalaTest implementation for JUnit 5 Test Engine.
@@ -262,92 +263,204 @@ class ScalaTestEngine extends org.junit.platform.engine.TestEngine {
       val listener = request.getEngineExecutionListener
 
       listener.executionStarted(engineDesc)
-      engineDesc.getChildren.asScala.foreach { testDesc =>
-        testDesc match {
-          case clzDesc: ScalaTestClassDescriptor =>
-            logger.fine("Start execution of suite class " + clzDesc.suiteClass.getName + "...")
-            listener.executionStarted(clzDesc)
-            val suiteClass = clzDesc.suiteClass
-            val canInstantiate = JUnitHelper.checkForPublicNoArgConstructor(suiteClass) && classOf[org.scalatest.Suite].isAssignableFrom(suiteClass)
-            require(canInstantiate, "Must pass an org.scalatest.Suite with a public no-arg constructor")
-            val suiteToRun = suiteClass.newInstance.asInstanceOf[org.scalatest.Suite]
-            val reporter = new EngineExecutionListenerReporter(listener, clzDesc, engineDesc)
-            val children = clzDesc.getChildren.asScala
+      var engineFailure: Option[Throwable] = None
+      try {
+        val numThreadsProp = System.getProperty("org.scalatestplus.junit5.numThreads", "1")
+        val numThreads =
+          Try(numThreadsProp.toInt).getOrElse(
+            throw new RuntimeException(Resources.invalidNumThreads(numThreadsProp))
+          )
+        if (numThreads < 0)
+          throw new RuntimeException(Resources.invalidNumThreads(numThreadsProp))
 
-            val filter = {
-              if (children.isEmpty)
-                Filter(
-                  tagsToInclude = None,
-                  excludeNestedSuites = false,
-                  dynaTags = DynaTags(Map.empty, Map(suiteToRun.suiteId -> Map.empty))
-                )
-              if (suiteToRun.testNames.size == children.size)  // When testNames size is same as children size, it means all tests are selected, so no need to apply filter, this solves the issue of dynamic test names when running suite.
-                Filter.default
-              else {
-                val SelectedTag = "Selected"
-                val SelectedSet = Set(SelectedTag)
-                val testNames = suiteToRun.testNames
-                val desiredTests: Set[String] =
-                  children.map(_.getDisplayName).filter { tn =>
-                    testNames.contains(tn) || testNames.contains(NameTransformer.decode(tn))
-                  }.toSet
-                val taggedTests: Map[String, Set[String]] = desiredTests.map(_ -> SelectedSet).toMap
-                val suiteId = suiteToRun.suiteId
-                Filter(
-                  tagsToInclude = Some(SelectedSet),
-                  excludeNestedSuites = true,
-                  dynaTags = DynaTags(Map.empty, Map(suiteId -> taggedTests))
-                )
-              }
-            }
-
-            if (suiteToRun.isInstanceOf[ParallelTestExecution]) {
-              val numThreads = System.getProperty("org.scalatestplus.junit5.numThreads", "0")
-              val poolSize =
-                if (System.getProperty("org.scalatestplus.junit5.numThreads", "0") == "0")
-                  Runtime.getRuntime.availableProcessors * 2
-                else
-                  Try(numThreads.toInt).getOrElse(throw new RuntimeException(Resources.invalidNumThreads(numThreads)))
-              val threadFactory =
-                new ThreadFactory {
-                  val defaultThreadFactory = Executors.defaultThreadFactory
-                  val atomicThreadCounter = new AtomicInteger
-                  def newThread(runnable: Runnable): Thread = {
-                    val thread = defaultThreadFactory.newThread(runnable)
-                    thread.setName("ScalaTest-" + atomicThreadCounter.incrementAndGet())
-                    thread
-                  }
-                }
-
-              val execSvc: ExecutorService =
-                if (poolSize > 0)
-                  Executors.newFixedThreadPool(poolSize, threadFactory)
-                else
-                  Executors.newCachedThreadPool(threadFactory)
-              val distributor = new ConcurrentDistributor(Args(reporter, Stopper.default, filter, ConfigMap.empty, None, new Tracker), execSvc)
-              try {
-                suiteToRun.run(None, Args(reporter, Stopper.default, filter, ConfigMap.empty, Some(distributor), new Tracker))
-                distributor.waitUntilDone()
-              } finally {
-                execSvc.shutdown()
-              }
-            }
-            else {
-              val status = suiteToRun.run(None, Args(reporter, Stopper.default, filter, ConfigMap.empty, None, new Tracker))
-              status.waitUntilCompleted()
-            }
-
-            listener.executionFinished(clzDesc, TestExecutionResult.successful())
-
-            logger.config("Completed execution of suite class " + clzDesc.suiteClass.getName + ".")
-
+        val suiteDescriptors = engineDesc.getChildren.asScala.flatMap {
+          case clzDesc: ScalaTestClassDescriptor => Some(clzDesc)
           case otherDesc =>
-            // Do nothing for other descriptor, just log it.
             logger.warning("Found test descriptor " + otherDesc.toString + " that is not supported, skipping.")
+            None
+        }.toList
+
+        if (numThreads == 1) {
+          // ParallelTestExecution falls back to serial execution without a distributor.
+          suiteDescriptors.foreach { clzDesc =>
+            val completion = new CompletableFuture[Option[Throwable]]()
+            runSuite(clzDesc, listener, engineDesc, None, completion)
+            awaitCompletion(completion).foreach { t =>
+              if (engineFailure.isEmpty) engineFailure = Some(t)
+            }
+          }
+        } else {
+          val poolSize = if (numThreads == 0) Runtime.getRuntime.availableProcessors * 2 else numThreads
+          val suiteExecSvc = createExecutor(poolSize, "ScalaTest-Suite")
+          val distributor = new ConcurrentDistributor(suiteExecSvc)
+          val completions = ListBuffer.empty[CompletableFuture[Option[Throwable]]]
+          try {
+            suiteDescriptors.foreach { clzDesc =>
+              val completion = new CompletableFuture[Option[Throwable]]()
+              completions += completion
+              try {
+                suiteExecSvc.submit(new Runnable {
+                  override def run(): Unit =
+                    runSuite(clzDesc, listener, engineDesc, Some(distributor), completion)
+                })
+              }
+              catch {
+                case t: Throwable =>
+                  completion.complete(Some(t))
+                  throw t
+              }
+            }
+            val errors = completions.toList.flatMap(awaitCompletion)
+            errors.headOption.foreach { t => engineFailure = Some(t) }
+          } finally {
+            // Drain submitted suites even if submitting a later one failed.
+            completions.foreach(awaitCompletion)
+            shutdownAndAwait(suiteExecSvc)
+          }
+        }
+
+        logger.fine("Completed tests execution.")
+      } catch {
+        case t: Throwable =>
+          if (engineFailure.isEmpty) engineFailure = Some(t)
+          throw t
+      } finally {
+        listener.executionFinished(
+          engineDesc,
+          engineFailure.fold(TestExecutionResult.successful())(TestExecutionResult.failed)
+        )
+      }
+    }
+  }
+
+  private def createExecutor(poolSize: Int, threadPrefix: String): ExecutorService = {
+    val threadCounter = new AtomicInteger
+    val threadFactory = new ThreadFactory {
+      val defaultThreadFactory = Executors.defaultThreadFactory
+      def newThread(runnable: Runnable): Thread = {
+        val thread = defaultThreadFactory.newThread(runnable)
+        thread.setName(threadPrefix + "-" + threadCounter.incrementAndGet())
+        thread
+      }
+    }
+    if (poolSize > 0) Executors.newFixedThreadPool(poolSize, threadFactory)
+    else Executors.newCachedThreadPool(threadFactory)
+  }
+
+  private def shutdownAndAwait(execSvc: ExecutorService): Unit = {
+    execSvc.shutdown()
+    // A completed status need not mean all queued distributor work has stopped reporting.
+    if (!execSvc.awaitTermination(1, TimeUnit.HOURS))
+      execSvc.shutdownNow()
+  }
+
+  private def awaitCompletion(completion: CompletableFuture[Option[Throwable]]): Option[Throwable] = {
+    var interrupted = false
+    var completed = false
+    var result: Option[Throwable] = None
+    while (!completed) {
+      try {
+        result = completion.get()
+        completed = true
+      }
+      catch {
+        case _: InterruptedException =>
+          interrupted = true
+      }
+    }
+    if (interrupted)
+      Thread.currentThread().interrupt()
+    result
+  }
+
+  /**
+   * Complete the future when the suite's Status finishes, without waiting for
+   * distributed work on an executor worker.
+   */
+  private def runSuite(
+    clzDesc: ScalaTestClassDescriptor,
+    listener: org.junit.platform.engine.EngineExecutionListener,
+    engineDesc: org.junit.platform.engine.TestDescriptor,
+    distributor: Option[ConcurrentDistributor],
+    completion: CompletableFuture[Option[Throwable]]
+  ): Unit = {
+    logger.fine("Start execution of suite class " + clzDesc.suiteClass.getName + "...")
+    var reporter: EngineExecutionListenerReporter = null
+    val finishStarted = new java.util.concurrent.atomic.AtomicBoolean(false)
+
+    def finishSuite(failure: Option[Throwable]): Unit = {
+      if (finishStarted.compareAndSet(false, true)) {
+        try {
+          // SuiteAborted may already have finished clzDesc.
+          if (reporter == null || reporter.suiteResult.isEmpty) {
+            val result = failure.fold(TestExecutionResult.successful())(TestExecutionResult.failed)
+            if (reporter == null)
+              listener.executionFinished(clzDesc, result)
+            else
+              reporter.finishSuite(result)
+          }
+        }
+        finally {
+          val reported = failure.orElse(if (reporter == null) None else reporter.runAborted)
+          completion.complete(reported)
         }
       }
-      listener.executionFinished(engineDesc, TestExecutionResult.successful())
-      logger.fine("Completed tests execution.")
+    }
+
+    try {
+      listener.executionStarted(clzDesc)
+      val suiteClass = clzDesc.suiteClass
+      val canInstantiate = JUnitHelper.checkForPublicNoArgConstructor(suiteClass) && classOf[org.scalatest.Suite].isAssignableFrom(suiteClass)
+      require(canInstantiate, "Must pass an org.scalatest.Suite with a public no-arg constructor")
+      val suiteToRun = suiteClass.newInstance.asInstanceOf[org.scalatest.Suite]
+      reporter = new EngineExecutionListenerReporter(listener, clzDesc, engineDesc)
+      val children = clzDesc.getChildren.asScala
+
+      val filter =
+        // When JUnit filters out every discovered test, do not run them again.
+        if (children.isEmpty && clzDesc.autoAddTestChildren && suiteToRun.testNames.nonEmpty)
+          Filter(
+            tagsToInclude = Some(Set("Selected")),
+            excludeNestedSuites = true,
+            dynaTags = DynaTags(Map.empty, Map(suiteToRun.suiteId -> Map.empty))
+          )
+        else if (children.isEmpty)
+          Filter(
+            tagsToInclude = None,
+            excludeNestedSuites = false,
+            dynaTags = DynaTags(Map.empty, Map(suiteToRun.suiteId -> Map.empty))
+          )
+        else if (suiteToRun.testNames.size == children.size) // When testNames size is same as children size, it means all tests are selected, so no need to apply filter, this solves the issue of dynamic test names when running suite.
+          Filter.default
+        else {
+          val SelectedTag = "Selected"
+          val SelectedSet = Set(SelectedTag)
+          val testNames = suiteToRun.testNames
+          val desiredTests: Set[String] =
+            children.map(_.getDisplayName).filter { tn =>
+              testNames.contains(tn) || testNames.contains(NameTransformer.decode(tn))
+            }.toSet
+          val taggedTests: Map[String, Set[String]] = desiredTests.map(_ -> SelectedSet).toMap
+          val suiteId = suiteToRun.suiteId
+          Filter(
+            tagsToInclude = Some(SelectedSet),
+            excludeNestedSuites = true,
+            dynaTags = DynaTags(Map.empty, Map(suiteId -> taggedTests))
+          )
+        }
+
+      val status = suiteToRun.run(None, Args(reporter, Stopper.default, filter, ConfigMap.empty, distributor, new Tracker))
+      status.whenCompleted {
+        case Success(_) =>
+          // Test failures belong to test descriptors, not the suite descriptor.
+          finishSuite(None)
+        case Failure(t) =>
+          finishSuite(Some(t))
+      }
+      logger.config("Started execution of suite class " + clzDesc.suiteClass.getName + ".")
+    } catch {
+      case t: Throwable =>
+        finishSuite(Some(t))
     }
   }
 }
